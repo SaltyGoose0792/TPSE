@@ -1,0 +1,181 @@
+// ============================================================
+//  WATER-LEVEL → SOLENOIDS CONTROL (Arduino + ULN2003/2803)
+//
+//  Behavior:
+//    - When sensor voltage is "HIGH" (wet/saturated) for a short time,
+//      all solenoids OPEN (valves energized).
+//    - When sensor voltage is "LOW" (dry) for a short time,
+//      all solenoids CLOSE.
+//    - If sensor rails at ~0V or ~5V (fault), valves are FORCED CLOSED.
+//
+//  Serial Monitor: 9600 baud
+// ============================================================
+
+
+// ------------------------------------------------------------
+//  TUNING / CALIBRATION SECTION (CHANGE THESE ONLY)
+// ------------------------------------------------------------
+
+// 1) PINS
+// Analog pin where the sensor's analog output (AO) is connected:
+const int SENSOR_PIN = A0;
+
+// Digital pins driving ULN inputs for each solenoid channel:
+// Edit this list to match your wiring.
+const int valvePins[] = {8, 9, 10, 11};  // D8..D11 -> ULN IN1..IN4
+const int NUM_VALVES = sizeof(valvePins) / sizeof(valvePins[0]);
+
+// 2) ADC / VOLTAGE CONVERSION
+// Measured 5V reference on your Arduino (use a multimeter on the 5V pin).
+// If you didn't measure, leave as 5.00.
+const float VREF = 5.00;   // [V] ADC reference voltage
+
+// 3) WATER LEVEL THRESHOLDS (VERY IMPORTANT)
+// Insert the voltages you measured at different water levels:
+//
+// Example procedure:
+//  - Print sensor voltage with Serial (this code does it).
+//  - Note V when "tank FULL / sensor fully wet".
+//  - Note V when "tank EMPTY / sensor dry".
+//  - Choose ON_V between those where you want valves to OPEN.
+//  - Choose OFF_V below ON_V where you want valves to CLOSE.
+const float ON_V  = 1.30;  // [V] valves OPEN when sensor voltage >= ON_V (wet)
+const float OFF_V = 0.90;  // [V] valves CLOSE when sensor voltage <= OFF_V (dry)
+
+// 4) FILTERING / TIMING
+// Number of analog samples to average each loop (higher = smoother, slower).
+const int   SAMPLES      = 12;
+
+// Time (ms) the condition must stay true before changing valve state.
+// Increase this if waves/slosh cause false triggers.
+const unsigned long CONFIRM_MS   = 800;  // [ms]
+
+// 5) SENSOR FAULT DETECTION
+// Raw ADC values near 0 or 1023 usually mean wiring/power fault.
+// If raw stays at those rails long enough, valves are forced CLOSED.
+const int HI_FAULT_RAW      = 1015;  // high rail (~5V)
+const int LO_FAULT_RAW      = 5;     // low rail (~0V)
+const unsigned long FAULT_HOLD_MS = 800;  // [ms] rail duration before fault
+
+
+// ------------------------------------------------------------
+//  INTERNAL STATE (DO NOT EDIT BELOW THIS LINE UNLESS NEEDED)
+// ------------------------------------------------------------
+
+bool valvesOn = false;
+unsigned long condStart   = 0;
+bool faultActive          = false;
+unsigned long faultStart  = 0;
+
+
+// ---- Helper: average ADC readings ----
+int readAveragedRaw(int pin, int n) {
+  long sum = 0;
+  for (int i = 0; i < n; i++) {
+    sum += analogRead(pin);
+    delay(2);
+  }
+  return (int)(sum / n);
+}
+
+// ---- Helper: raw ADC (0..1023) → voltage ----
+float rawToVolts(int raw) {
+  return (raw * VREF) / 1023.0;
+}
+
+// ---- Helper: set all valves ON/OFF ----
+void setAllValves(bool on) {
+  for (int i = 0; i < NUM_VALVES; i++) {
+    digitalWrite(valvePins[i], on ? HIGH : LOW);
+  }
+  valvesOn = on;
+  Serial.println(on ? "VALVES -> ON" : "VALVES -> OFF");
+}
+
+
+// ------------------------------------------------------------
+//  SETUP
+// ------------------------------------------------------------
+void setup() {
+  // Configure valve pins
+  for (int i = 0; i < NUM_VALVES; i++) {
+    pinMode(valvePins[i], OUTPUT);
+    digitalWrite(valvePins[i], LOW);  // start CLOSED
+  }
+
+  Serial.begin(9600);
+  Serial.println("Water-level control starting...");
+  Serial.print("ON_V = ");  Serial.print(ON_V, 3);
+  Serial.print(" V, OFF_V = "); Serial.print(OFF_V, 3);
+  Serial.println(" V");
+  Serial.println("Edit TUNING / CALIBRATION section at top to change behavior.");
+}
+
+
+// ------------------------------------------------------------
+//  MAIN LOOP
+// ------------------------------------------------------------
+void loop() {
+  // Read and convert sensor value
+  int   raw = readAveragedRaw(SENSOR_PIN, SAMPLES);
+  float v   = rawToVolts(raw);
+  unsigned long now = millis();
+
+  // ----- 1) SENSOR FAULT DETECTION -----
+  // If raw is pinned near 0 or 1023 for FAULT_HOLD_MS, treat as fault and force valves closed.
+  bool railed = (raw >= HI_FAULT_RAW) || (raw <= LO_FAULT_RAW);
+
+  if (railed) {
+    if (faultStart == 0) faultStart = now;
+    if ((now - faultStart) >= FAULT_HOLD_MS) {
+      faultActive = true;
+    }
+  } else {
+    faultStart  = 0;
+    faultActive = false;
+  }
+
+  if (faultActive) {
+    if (valvesOn) {
+      setAllValves(false);  // force CLOSED on fault
+    }
+    Serial.print("Raw: "); Serial.print(raw);
+    Serial.print(" | V: "); Serial.print(v, 3);
+    Serial.println(" | FAULT: sensor pegged -> valves FORCED CLOSED");
+    delay(300);
+    return; // skip normal control while fault is active
+  }
+
+  // ----- 2) DEBUG OUTPUT -----
+  Serial.print("Raw: "); Serial.print(raw);
+  Serial.print(" | V: "); Serial.print(v, 3);
+  Serial.print(" V | Valves: ");
+  Serial.println(valvesOn ? "OPEN" : "CLOSED");
+
+  // ----- 3) CONTROL LOGIC (HYSTERESIS + CONFIRM TIME) -----
+  if (!valvesOn) {
+    // Currently CLOSED; check if we should OPEN
+    if (v >= ON_V) {
+      if (condStart == 0) condStart = now;  // start timing
+      if ((now - condStart) >= CONFIRM_MS) {
+        setAllValves(true);   // OPEN
+        condStart = 0;
+      }
+    } else {
+      condStart = 0;          // reset timer if condition breaks
+    }
+  } else {
+    // Currently OPEN; check if we should CLOSE
+    if (v <= OFF_V) {
+      if (condStart == 0) condStart = now;
+      if ((now - condStart) >= CONFIRM_MS) {
+        setAllValves(false);  // CLOSE
+        condStart = 0;
+      }
+    } else {
+      condStart = 0;
+    }
+  }
+
+  delay(300);  // We do not need can delete ---loop rate ~3–4 Hz 
+}
